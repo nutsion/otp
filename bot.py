@@ -1,37 +1,28 @@
-import requests
 import time
 import re
 import hashlib
 import json
 import os
+from playwright.sync_api import sync_playwright
 
 # ============================================
-# KONFIGURASI - GANTI BAGIAN INI
+# KONFIGURASI
 # ============================================
 
-# Token BARU dari @BotFather (revoke token lama dulu!)
 BOT_TOKEN = "8578361582:AAHwuC8x9CmdEJB0_4KF6fJg7ctUIRm9lOY"
-
-# ID Telegram kamu (owner)
 OWNER_ID = 8965979911
-
-# ID Grup Telegram
 GROUP_ID = -5445996631
 
-# Akun IVASMS kamu
 IVASMS_EMAIL = "alifvivo124@gmail.com"
-IVASMS_PASSWORD = "ixizpop9988@"
+IVASMS_PASSWORD = "nutsdev1"
 
-# Interval cek OTP (detik) - jangan di bawah 15
-POLL_INTERVAL = 30
-
-# Alamat API Telegram
+POLL_INTERVAL = 60
 TELEGRAM_API = "https://api.telegram.org"
-
 CACHE_FILE = "otp_cache.json"
 
 
 def send_telegram(chat_id, text):
+    import requests
     url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -54,29 +45,61 @@ class IVASMSScraper:
     def __init__(self, email, password):
         self.email = email
         self.password = password
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+        self.playwright = None
+        self.browser = None
+        self.page = None
         self.logged_in = False
+
+    def start(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
+        self.page = self.browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        print("[OK] Browser siap")
 
     def login(self):
         try:
-            self.session.get("https://ivasms.com/", timeout=15)
-            data = {
-                "email": self.email,
-                "password": self.password,
-                "remember": "on"
-            }
-            resp = self.session.post(
-                "https://ivasms.com/login",
-                data=data,
-                timeout=15,
-                allow_redirects=True
-            )
-            if "logout" in resp.text.lower() or "dashboard" in resp.url.lower():
+            print("[INFO] Buka halaman login IVASMS...")
+            self.page.goto("https://www.ivasms.com/login", timeout=60000)
+            self.page.wait_for_timeout(8000)  # tunggu Cloudflare selesai
+
+            # Cek apakah halaman login sudah kebuka
+            content = self.page.content().lower()
+            if "cloudflare" in content and "just a moment" in content:
+                print("[WAIT] Cloudflare challenge, tunggu...")
+                self.page.wait_for_timeout(10000)
+
+            print("[INFO] Isi form login...")
+            # Coba beberapa selector umum
+            try:
+                self.page.fill('input[name="email"]', self.email, timeout=10000)
+            except:
+                self.page.fill('input[type="email"]', self.email, timeout=10000)
+
+            self.page.fill('input[name="password"]', self.password, timeout=10000)
+
+            print("[INFO] Klik login...")
+            self.page.click('button[type="submit"]', timeout=10000)
+            self.page.wait_for_timeout(8000)
+
+            # Cek login berhasil
+            url_sekarang = self.page.url.lower()
+            content_sekarang = self.page.content().lower()
+
+            if "dashboard" in url_sekarang or "logout" in content_sekarang:
                 self.logged_in = True
                 print("[OK] Login IVASMS berhasil")
                 return True
-            print("[GAGAL] Login gagal, cek email/password")
+
+            print(f"[GAGAL] Login gagal. URL: {self.page.url}")
             return False
         except Exception as e:
             print(f"[ERROR] Login: {e}")
@@ -87,8 +110,14 @@ class IVASMSScraper:
             if not self.login():
                 return []
         try:
-            resp = self.session.get("https://ivasms.com/otp", timeout=15)
-            html = resp.text
+            self.page.goto("https://www.ivasms.com/otp", timeout=30000)
+            self.page.wait_for_timeout(3000)
+            html = self.page.content()
+
+            # Simpan HTML untuk debug
+            with open("last_page.html", "w", encoding="utf-8") as f:
+                f.write(html)
+
             otps = []
             pola = re.compile(r'(\+?\d{10,15})\D{0,50}?(\d{6})')
             for match in pola.finditer(html):
@@ -100,6 +129,12 @@ class IVASMSScraper:
         except Exception as e:
             print(f"[ERROR] Fetch OTP: {e}")
             return []
+
+    def close(self):
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
 
 
 def load_cache():
@@ -127,18 +162,19 @@ def fingerprint(item):
 
 def main():
     print("=" * 40)
-    print("BOT IVASMS OTP - START")
+    print("BOT IVASMS OTP - START (Playwright)")
     print(f"Owner: {OWNER_ID}")
     print(f"Grup : {GROUP_ID}")
     print("=" * 40)
 
     scraper = IVASMSScraper(IVASMS_EMAIL, IVASMS_PASSWORD)
+    scraper.start()
     cache = load_cache()
 
     print("[INFO] Kirim notif start...")
-    send_telegram(OWNER_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
+    send_telegram(OWNER_ID, "[BOT] Aktif (Playwright), mulai pantau OTP IVASMS")
     time.sleep(1)
-    send_telegram(GROUP_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
+    send_telegram(GROUP_ID, "[BOT] Aktif (Playwright), mulai pantau OTP IVASMS")
 
     while True:
         try:
