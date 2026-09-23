@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import requests
-from playwright.sync_api import sync_playwright
+import urllib.parse
 
 # ============================================
 # KONFIGURASI
@@ -19,6 +19,7 @@ IVASMS_PASSWORD = "nutsdev1"
 
 POLL_INTERVAL = 60
 TELEGRAM_API = "https://api.telegram.org"
+FLARESOLVERR_URL = "http://localhost:8191/v1"
 CACHE_FILE = "otp_cache.json"
 
 
@@ -45,72 +46,81 @@ class IVASMSScraper:
     def __init__(self, email, password):
         self.email = email
         self.password = password
-        self.playwright = None
-        self.browser = None
-        self.page = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
         self.logged_in = False
 
-    def start(self):
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled"
-            ]
-        )
-        self.page = self.browser.new_page(user_agent="Mozilla/5.0")
-        print("[OK] Browser siap")
+    def flaresolverr_get(self, url):
+        """Request ke URL via FlareSolverr (bypass Cloudflare)"""
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": 60000
+        }
+        try:
+            r = requests.post(FLARESOLVERR_URL, json=payload, timeout=90)
+            data = r.json()
+            if data.get("status") == "ok":
+                solution = data["solution"]
+                # Update cookies dari FlareSolverr
+                for cookie in solution.get("cookies", []):
+                    self.session.cookies.set(
+                        cookie["name"],
+                        cookie["value"],
+                        domain=cookie.get("domain", ".ivasms.com")
+                    )
+                return solution.get("response", "")
+            else:
+                print(f"[ERROR] FlareSolverr: {data.get('message')}")
+                return ""
+        except Exception as e:
+            print(f"[ERROR] FlareSolverr: {e}")
+            return ""
 
     def login(self):
         try:
-            print("[INFO] Buka halaman login IVASMS...")
-            self.page.goto("https://www.ivasms.com/login", timeout=60000)
+            print("[INFO] Buka halaman login via FlareSolverr...")
+            html = self.flaresolverr_get("https://www.ivasms.com/login")
 
-            print("[WAIT] Tunggu 30 detik untuk Cloudflare...")
-            self.page.wait_for_timeout(30000)
+            if not html or "cloudflare" in html.lower() and "just a moment" in html.lower():
+                print("[GAGAL] Masih kena Cloudflare")
+                return False
 
-            self.page.screenshot(path="login_debug.png", full_page=True)
-            print("[DEBUG] Screenshot disimpan: login_debug.png")
+            print("[OK] Halaman login kebuka, length:", len(html))
 
-            with open("login_debug.html", "w", encoding="utf-8") as f:
-                f.write(self.page.content())
-            print("[DEBUG] HTML disimpan: login_debug.html")
+            # Cari CSRF token di form
+            csrf = ""
+            csrf_match = re.search(r'name="_token"\s+value="([^"]+)"', html)
+            if csrf_match:
+                csrf = csrf_match.group(1)
+                print(f"[INFO] CSRF token ditemukan")
 
-            inputs = self.page.query_selector_all("input")
-            print(f"[DEBUG] Ditemukan {len(inputs)} input:")
-            for inp in inputs:
-                name = inp.get_attribute("name") or "(no name)"
-                tipe = inp.get_attribute("type") or "(no type)"
-                print(f"  - name={name}, type={tipe}")
+            # Cari nama field
+            email_field = "email"
+            if 'name="username"' in html:
+                email_field = "username"
 
-            content = self.page.content().lower()
-            if "cloudflare" in content and "just a moment" in content:
-                print("[WAIT] Masih Cloudflare challenge, tunggu 15 detik lagi...")
-                self.page.wait_for_timeout(15000)
+            # Submit login via requests (pakai cookies dari FlareSolverr)
+            data = {
+                email_field: self.email,
+                "password": self.password,
+                "_token": csrf,
+                "remember": "on"
+            }
 
-            print("[INFO] Isi form login...")
-            try:
-                self.page.fill('input[name="email"]', self.email, timeout=10000)
-            except Exception:
-                self.page.fill('input[type="email"]', self.email, timeout=10000)
+            login_url = "https://www.ivasms.com/login"
+            r = self.session.post(login_url, data=data, timeout=30, allow_redirects=True)
 
-            self.page.fill('input[name="password"]', self.password, timeout=10000)
-
-            print("[INFO] Klik login...")
-            self.page.click('button[type="submit"]', timeout=10000)
-            self.page.wait_for_timeout(8000)
-
-            url_sekarang = self.page.url.lower()
-            content_sekarang = self.page.content().lower()
-
-            if "dashboard" in url_sekarang or "logout" in content_sekarang:
+            if "logout" in r.text.lower() or "dashboard" in r.url.lower():
                 self.logged_in = True
                 print("[OK] Login IVASMS berhasil")
                 return True
 
-            print(f"[GAGAL] Login gagal. URL: {self.page.url}")
+            print(f"[GAGAL] Login gagal. URL akhir: {r.url}")
+            with open("login_fail.html", "w", encoding="utf-8") as f:
+                f.write(r.text)
             return False
         except Exception as e:
             print(f"[ERROR] Login: {e}")
@@ -121,15 +131,17 @@ class IVASMSScraper:
             if not self.login():
                 return []
         try:
-            self.page.goto("https://www.ivasms.com/otp", timeout=30000)
-            self.page.wait_for_timeout(3000)
-            html = self.page.content()
+            print("[INFO] Ambil halaman OTP via FlareSolverr...")
+            html = self.flaresolverr_get("https://www.ivasms.com/otp")
 
-            with open("last_page.html", "w", encoding="utf-8") as f:
+            if not html:
+                return []
+
+            with open("otp_page.html", "w", encoding="utf-8") as f:
                 f.write(html)
 
             otps = []
-            pola = re.compile(r'(\+?\d{10,15})\D{0,50}?(\d{6})')
+            pola = re.compile(r'(\+?\d{10,15})\D{0,50}?(\d{4,8})')
             for match in pola.finditer(html):
                 otps.append({
                     "phone": match.group(1),
@@ -139,12 +151,6 @@ class IVASMSScraper:
         except Exception as e:
             print(f"[ERROR] Fetch OTP: {e}")
             return []
-
-    def close(self):
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
 
 
 def load_cache():
@@ -172,19 +178,27 @@ def fingerprint(item):
 
 def main():
     print("=" * 40)
-    print("BOT IVASMS OTP - START (Playwright)")
+    print("BOT IVASMS OTP - START (FlareSolverr)")
     print(f"Owner: {OWNER_ID}")
     print(f"Grup : {GROUP_ID}")
     print("=" * 40)
 
+    # Test FlareSolverr dulu
+    try:
+        r = requests.get("http://localhost:8191/", timeout=5)
+        print("[OK] FlareSolverr aktif")
+    except Exception as e:
+        print(f"[ERROR] FlareSolverr tidak jalan: {e}")
+        print("[INFO] Jalankan dulu: docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr")
+        return
+
     scraper = IVASMSScraper(IVASMS_EMAIL, IVASMS_PASSWORD)
-    scraper.start()
     cache = load_cache()
 
     print("[INFO] Kirim notif start...")
-    send_telegram(OWNER_ID, "[BOT] Aktif (Playwright), mulai pantau OTP IVASMS")
+    send_telegram(OWNER_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
     time.sleep(1)
-    send_telegram(GROUP_ID, "[BOT] Aktif (Playwright), mulai pantau OTP IVASMS")
+    send_telegram(GROUP_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
 
     while True:
         try:
