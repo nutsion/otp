@@ -3,6 +3,7 @@ import re
 import hashlib
 import json
 import os
+import requests
 from playwright.sync_api import sync_playwright
 
 # ============================================
@@ -22,7 +23,6 @@ CACHE_FILE = "otp_cache.json"
 
 
 def send_telegram(chat_id, text):
-    import requests
     url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -60,28 +60,40 @@ class IVASMSScraper:
                 "--disable-blink-features=AutomationControlled"
             ]
         )
-        self.page = self.browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        self.page = self.browser.new_page(user_agent="Mozilla/5.0")
         print("[OK] Browser siap")
 
     def login(self):
         try:
             print("[INFO] Buka halaman login IVASMS...")
             self.page.goto("https://www.ivasms.com/login", timeout=60000)
-            self.page.wait_for_timeout(8000)  # tunggu Cloudflare selesai
 
-            # Cek apakah halaman login sudah kebuka
+            print("[WAIT] Tunggu 30 detik untuk Cloudflare...")
+            self.page.wait_for_timeout(30000)
+
+            self.page.screenshot(path="login_debug.png", full_page=True)
+            print("[DEBUG] Screenshot disimpan: login_debug.png")
+
+            with open("login_debug.html", "w", encoding="utf-8") as f:
+                f.write(self.page.content())
+            print("[DEBUG] HTML disimpan: login_debug.html")
+
+            inputs = self.page.query_selector_all("input")
+            print(f"[DEBUG] Ditemukan {len(inputs)} input:")
+            for inp in inputs:
+                name = inp.get_attribute("name") or "(no name)"
+                tipe = inp.get_attribute("type") or "(no type)"
+                print(f"  - name={name}, type={tipe}")
+
             content = self.page.content().lower()
             if "cloudflare" in content and "just a moment" in content:
-                print("[WAIT] Cloudflare challenge, tunggu...")
-                self.page.wait_for_timeout(10000)
+                print("[WAIT] Masih Cloudflare challenge, tunggu 15 detik lagi...")
+                self.page.wait_for_timeout(15000)
 
             print("[INFO] Isi form login...")
-            # Coba beberapa selector umum
             try:
                 self.page.fill('input[name="email"]', self.email, timeout=10000)
-            except:
+            except Exception:
                 self.page.fill('input[type="email"]', self.email, timeout=10000)
 
             self.page.fill('input[name="password"]', self.password, timeout=10000)
@@ -90,7 +102,6 @@ class IVASMSScraper:
             self.page.click('button[type="submit"]', timeout=10000)
             self.page.wait_for_timeout(8000)
 
-            # Cek login berhasil
             url_sekarang = self.page.url.lower()
             content_sekarang = self.page.content().lower()
 
@@ -114,7 +125,6 @@ class IVASMSScraper:
             self.page.wait_for_timeout(3000)
             html = self.page.content()
 
-            # Simpan HTML untuk debug
             with open("last_page.html", "w", encoding="utf-8") as f:
                 f.write(html)
 
