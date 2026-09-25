@@ -1,238 +1,260 @@
-import time
-import re
-import hashlib
-import json
 import os
+import re
+import time
 import requests
-import urllib.parse
+from bs4 import BeautifulSoup
+from neonize.client import NewClient
+from neonize.events import MessageEv, ConnectedEv
+from neonize.utils import JID
 
-# ============================================
-# KONFIGURASI
-# ============================================
+from config import LOGIN_URL, OTP_URL, USERNAME, PASSWORD, DOWNLOAD_DIR
 
-BOT_TOKEN = "8578361582:AAHwuC8x9CmdEJB0_4KF6fJg7ctUIRm9lOY"
-OWNER_ID = 8965979911
-GROUP_ID = -5445996631
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-IVASMS_EMAIL = "alifvivo124@gmail.com"
-IVASMS_PASSWORD = "nutsdev1"
+client = NewClient("bot_otp_session")
 
-POLL_INTERVAL = 60
-TELEGRAM_API = "https://api.telegram.org"
-FLARESOLVERR_URL = "http://localhost:8191/v1"
-CACHE_FILE = "otp_cache.json"
+# ============ WEB SESSION ============
+web_session = requests.Session()
+web_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Referer": LOGIN_URL,
+})
 
 
-def send_telegram(chat_id, text):
-    url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+def login_web() -> bool:
+    """Login ke website target, simpan session"""
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        hasil = r.json()
-        if not hasil.get("ok"):
-            print(f"[ERROR] Gagal kirim ke {chat_id}: {hasil}")
-        return hasil
-    except Exception as e:
-        print(f"[ERROR] Exception: {e}")
-        return None
+        # 1. GET halaman login (untuk ambil CSRF token kalau ada)
+        r = web_session.get(LOGIN_URL, timeout=15)
+        r.raise_for_status()
 
-
-class IVASMSScraper:
-    def __init__(self, email, password):
-        self.email = email
-        self.password = password
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        self.logged_in = False
-
-    def flaresolverr_get(self, url):
-        """Request ke URL via FlareSolverr (bypass Cloudflare)"""
+        # 2. Parse hidden input (CSRF, token, dsb.)
+        soup = BeautifulSoup(r.text, "html.parser")
         payload = {
-            "cmd": "request.get",
-            "url": url,
-            "maxTimeout": 60000
+            # ⚠️ GANTI dengan name="" dari <input> di form login kamu
+            "username": USERNAME,
+            "password": PASSWORD,
         }
-        try:
-            r = requests.post(FLARESOLVERR_URL, json=payload, timeout=90)
-            data = r.json()
-            if data.get("status") == "ok":
-                solution = data["solution"]
-                # Update cookies dari FlareSolverr
-                for cookie in solution.get("cookies", []):
-                    self.session.cookies.set(
-                        cookie["name"],
-                        cookie["value"],
-                        domain=cookie.get("domain", ".ivasms.com")
-                    )
-                return solution.get("response", "")
-            else:
-                print(f"[ERROR] FlareSolverr: {data.get('message')}")
-                return ""
-        except Exception as e:
-            print(f"[ERROR] FlareSolverr: {e}")
-            return ""
+        # Auto-ambil hidden input
+        for hidden in soup.find_all("input", {"type": "hidden"}):
+            name = hidden.get("name")
+            value = hidden.get("value", "")
+            if name:
+                payload[name] = value
 
-    def login(self):
-        try:
-            print("[INFO] Buka halaman login via FlareSolverr...")
-            html = self.flaresolverr_get("https://www.ivasms.com/login")
+        # 3. POST login
+        r = web_session.post(LOGIN_URL, data=payload, timeout=15)
+        r.raise_for_status()
 
-            if not html or "cloudflare" in html.lower() and "just a moment" in html.lower():
-                print("[GAGAL] Masih kena Cloudflare")
-                return False
-
-            print("[OK] Halaman login kebuka, length:", len(html))
-
-            # Cari CSRF token di form
-            csrf = ""
-            csrf_match = re.search(r'name="_token"\s+value="([^"]+)"', html)
-            if csrf_match:
-                csrf = csrf_match.group(1)
-                print(f"[INFO] CSRF token ditemukan")
-
-            # Cari nama field
-            email_field = "email"
-            if 'name="username"' in html:
-                email_field = "username"
-
-            # Submit login via requests (pakai cookies dari FlareSolverr)
-            data = {
-                email_field: self.email,
-                "password": self.password,
-                "_token": csrf,
-                "remember": "on"
-            }
-
-            login_url = "https://www.ivasms.com/login"
-            r = self.session.post(login_url, data=data, timeout=30, allow_redirects=True)
-
-            if "logout" in r.text.lower() or "dashboard" in r.url.lower():
-                self.logged_in = True
-                print("[OK] Login IVASMS berhasil")
-                return True
-
-            print(f"[GAGAL] Login gagal. URL akhir: {r.url}")
-            with open("login_fail.html", "w", encoding="utf-8") as f:
-                f.write(r.text)
-            return False
-        except Exception as e:
-            print(f"[ERROR] Login: {e}")
+        # 4. Cek berhasil login
+        if "login" in r.url.lower() and "logout" not in r.text.lower():
+            print("❌ Login gagal — cek username/password")
             return False
 
-    def fetch_otps(self):
-        if not self.logged_in:
-            if not self.login():
-                return []
+        print("✅ Login web berhasil")
+        return True
+
+    except Exception as e:
+        print(f"❌ Error login: {e}")
+        return False
+
+
+def send_otp_request(nomor: str) -> dict:
+    """
+    Kirim request OTP untuk 1 nomor.
+    Return: {"success": bool, "message": str}
+    """
+    try:
+        # 1. GET halaman OTP (ambil CSRF & struktur form)
+        r = web_session.get(OTP_URL, timeout=15)
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        payload = {
+            # ⚠️ GANTI sesuai form di MySMSNumbers
+            # Contoh umum: "msisdn", "phone", "number", "nomor"
+            "msisdn": nomor,
+            "phone": nomor,
+            "number": nomor,
+        }
+        # Auto hidden input
+        for hidden in soup.find_all("input", {"type": "hidden"}):
+            name = hidden.get("name")
+            value = hidden.get("value", "")
+            if name:
+                payload[name] = value
+
+        # 2. POST ke endpoint OTP
+        r = web_session.post(OTP_URL, data=payload, timeout=15)
+        r.raise_for_status()
+
+        # 3. Cek respon (⚠️ sesuaikan dengan respon site kamu)
+        text_lower = r.text.lower()
+        if any(k in text_lower for k in ["success", "berhasil", "sent", "terkirim"]):
+            return {"success": True, "message": "OTP terkirim"}
+        elif any(k in text_lower for k in ["error", "gagal", "failed", "invalid"]):
+            return {"success": False, "message": "Gagal kirim OTP"}
+        else:
+            # Fallback: anggap sukses jika HTTP 200
+            return {"success": True, "message": "Request OK (cek manual)"}
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+# ============ HELPERS ============
+def parse_numbers_from_txt(filepath: str) -> list:
+    """Ambil nomor dari file .txt (1 nomor per baris, ignore komentar)"""
+    numbers = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Normalisasi: buang spasi, +, -, ()
+            clean = re.sub(r"[^\d]", "", line)
+            if clean:
+                numbers.append(clean)
+    return numbers
+
+
+def format_wa_number(nomor: str) -> str:
+    """Normalisasi nomor ke format WhatsApp (628xxx)"""
+    if nomor.startswith("0"):
+        nomor = "62" + nomor[1:]
+    elif nomor.startswith("8"):
+        nomor = "62" + nomor
+    return nomor
+
+
+# ============ WHATSAPP EVENTS ============
+@client.event(ConnectedEv)
+def on_connected(client: NewClient, event: ConnectedEv):
+    print("✅ Bot WhatsApp terhubung!")
+    print("🔐 Login ke website target...")
+    if login_web():
+        print("🎉 Bot siap menerima file .txt")
+    else:
+        print("⚠️ Login web gagal — perintah akan error")
+
+
+@client.event(MessageEv)
+def on_message(client: NewClient, message: MessageEv):
+    try:
+        sender = message.Info.MessageSource.Sender.User
+        chat_jid = JID(f"{sender}@s.whatsapp.net")
+
+        # Cek dokumen (file)
+        doc = message.Message.documentMessage
+        if doc and doc.fileName and doc.fileName.lower().endswith(".txt"):
+            handle_txt_upload(client, message, chat_jid, doc)
+            return
+
+        # Cek teks
         try:
-            print("[INFO] Ambil halaman OTP via FlareSolverr...")
-            html = self.flaresolverr_get("https://www.ivasms.com/otp")
-
-            if not html:
-                return []
-
-            with open("otp_page.html", "w", encoding="utf-8") as f:
-                f.write(html)
-
-            otps = []
-            pola = re.compile(r'(\+?\d{10,15})\D{0,50}?(\d{4,8})')
-            for match in pola.finditer(html):
-                otps.append({
-                    "phone": match.group(1),
-                    "otp": match.group(2)
-                })
-            return otps
-        except Exception as e:
-            print(f"[ERROR] Fetch OTP: {e}")
-            return []
-
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
+            text = message.Message.conversation or \
+                   message.Message.extendedTextMessage.text or ""
         except Exception:
-            return {}
-    return {}
+            text = ""
 
+        text = text.strip().lower()
 
-def save_cache(cache):
-    try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache, f)
+        if text == "!help":
+            client.send_message(chat_jid,
+                "🤖 *BOT OTP*\n\n"
+                "📌 *Cara pakai:*\n"
+                "1. Kirim file `.txt` (1 nomor per baris)\n"
+                "2. Bot otomatis login & kirim OTP ke semua nomor\n\n"
+                "📌 *Perintah:*\n"
+                "• `!login` — Login ulang ke web\n"
+                "• `!help` — Bantuan ini\n\n"
+                "📄 *Contoh isi file .txt:*\n"
+                "```\n628123456789\n"
+                "628987654321\n"
+                "# baris diawali # di-skip\n```"
+            )
+
+        elif text == "!login":
+            if login_web():
+                client.send_message(chat_jid, "✅ Login web berhasil")
+            else:
+                client.send_message(chat_jid, "❌ Login web gagal")
+
     except Exception as e:
-        print(f"[ERROR] Save cache: {e}")
+        print(f"❌ Handler error: {e}")
 
 
-def fingerprint(item):
-    raw = f"{item['phone']}:{item['otp']}"
-    return hashlib.md5(raw.encode()).hexdigest()
-
-
-def main():
-    print("=" * 40)
-    print("BOT IVASMS OTP - START (FlareSolverr)")
-    print(f"Owner: {OWNER_ID}")
-    print(f"Grup : {GROUP_ID}")
-    print("=" * 40)
-
-    # Test FlareSolverr dulu
+def handle_txt_upload(client, message, chat_jid, doc):
+    """Proses file .txt yang di-upload"""
     try:
-        r = requests.get("http://localhost:8191/", timeout=5)
-        print("[OK] FlareSolverr aktif")
-    except Exception as e:
-        print(f"[ERROR] FlareSolverr tidak jalan: {e}")
-        print("[INFO] Jalankan dulu: docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr")
-        return
+        # Download file dari WhatsApp
+        filename = f"{int(time.time())}_{doc.fileName}"
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
 
-    scraper = IVASMSScraper(IVASMS_EMAIL, IVASMS_PASSWORD)
-    cache = load_cache()
+        # Ambil URL media & download
+        msg = client.download_media_with_path(message, filepath)
+        print(f"📥 File tersimpan: {msg}")
 
-    print("[INFO] Kirim notif start...")
-    send_telegram(OWNER_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
-    time.sleep(1)
-    send_telegram(GROUP_ID, "[BOT] Aktif, mulai pantau OTP IVASMS")
+        # Parse nomor
+        numbers = parse_numbers_from_txt(msg)
+        total = len(numbers)
 
-    while True:
-        try:
-            daftar = scraper.fetch_otps()
-            print(f"[CEK] Dapat {len(daftar)} OTP")
+        if total == 0:
+            client.send_message(chat_jid, "❌ File kosong atau format salah")
+            return
 
-            for item in daftar:
-                fp = fingerprint(item)
-                if fp in cache:
-                    continue
+        client.send_message(chat_jid,
+            f"📄 File diterima: *{doc.fileName}*\n"
+            f"📊 Total nomor: *{total}*\n"
+            f"⏳ Mulai proses OTP..."
+        )
 
-                pesan = (
-                    f"<b>OTP BARU</b>\n\n"
-                    f"<b>Nomor:</b> <code>{item['phone']}</code>\n"
-                    f"<b>OTP:</b> <code>{item['otp']}</code>\n"
-                    f"<b>Waktu:</b> {time.strftime('%H:%M:%S')}"
+        sukses = 0
+        gagal = 0
+        gagal_list = []
+
+        for i, nomor in enumerate(numbers, 1):
+            wa_num = format_wa_number(nomor)
+            result = send_otp_request(nomor)
+
+            if result["success"]:
+                sukses += 1
+                print(f"[{i}/{total}] ✅ {nomor}")
+            else:
+                gagal += 1
+                gagal_list.append(nomor)
+                print(f"[{i}/{total}] ❌ {nomor} — {result['message']}")
+
+            # Progress report tiap 10 nomor
+            if i % 10 == 0:
+                client.send_message(chat_jid,
+                    f"📊 Progress: {i}/{total}\n"
+                    f"✅ Sukses: {sukses}\n"
+                    f"❌ Gagal: {gagal}"
                 )
 
-                send_telegram(OWNER_ID, pesan)
-                time.sleep(1)
-                send_telegram(GROUP_ID, pesan)
+            time.sleep(1)  # delay anti rate-limit
 
-                cache[fp] = int(time.time())
-                print(f"[KIRIM] OTP {item['otp']} - {item['phone']}")
+        # Ringkasan akhir
+        ringkasan = (
+            f"✅ *SELESAI*\n\n"
+            f"📊 Total: {total}\n"
+            f"✅ Sukses: {sukses}\n"
+            f"❌ Gagal: {gagal}"
+        )
+        if gagal_list and len(gagal_list) <= 20:
+            ringkasan += "\n\n❌ *Gagal:*\n" + "\n".join(gagal_list[:20])
 
-            now = int(time.time())
-            cache = {k: v for k, v in cache.items() if now - v < 1800}
-            save_cache(cache)
+        client.send_message(chat_jid, ringkasan)
 
-        except Exception as e:
-            print(f"[ERROR] Loop: {e}")
-
-        time.sleep(POLL_INTERVAL)
+    except Exception as e:
+        print(f"❌ Upload error: {e}")
+        client.send_message(chat_jid, f"❌ Error proses file: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Menjalankan bot OTP...")
+    print("📱 Scan QR kalau belum login")
+    client.connect()
